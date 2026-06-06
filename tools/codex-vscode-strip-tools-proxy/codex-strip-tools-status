@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PID_FILE="${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}"
+LOG_FILE="${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
+
+if [ ! -f "$PID_FILE" ]; then
+  echo "代理未运行"
+  exit 1
+fi
+
+PID="$(cat "$PID_FILE")"
+if kill -0 "$PID" 2>/dev/null; then
+  echo "代理正在运行：进程号=$PID"
+  echo "日志：$LOG_FILE"
+else
+  echo "进程号文件已过期：$PID_FILE 进程号=$PID"
+  exit 1
+fi

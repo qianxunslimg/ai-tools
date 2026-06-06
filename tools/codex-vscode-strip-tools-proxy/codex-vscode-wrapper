@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -f "$HOME/.zshenv" ]; then
+  . "$HOME/.zshenv"
+fi
+
+PROXY_HOST="${CODEX_STRIP_TOOLS_PROXY_HOST:-127.0.0.1}"
+PROXY_PORT="${CODEX_STRIP_TOOLS_PROXY_PORT:-18765}"
+PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
+PROXY_SCRIPT="${CODEX_STRIP_TOOLS_PROXY_SCRIPT:-$HOME/.codex/bin/codex-strip-tools-proxy.py}"
+PROXY_PID_FILE="${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}"
+PROXY_LOG_FILE="${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
+UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-https://muyuan.do/v1}"
+REAL_CODEX="${CODEX_REAL_BIN:-$HOME/.vscode/extensions/openai.chatgpt-26.602.40724-linux-x64/bin/linux-x86_64/codex}"
+
+proxy_is_ready() {
+  python3 - "$PROXY_HOST" "$PROXY_PORT" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket()
+sock.settimeout(0.2)
+try:
+    sock.connect((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+
+if ! proxy_is_ready; then
+  UPSTREAM_BASE_URL="$UPSTREAM_BASE_URL" \
+    python3 "$PROXY_SCRIPT" \
+      --host "$PROXY_HOST" \
+      --port "$PROXY_PORT" \
+      --daemon \
+      --pid-file "$PROXY_PID_FILE" \
+      --log-file "$PROXY_LOG_FILE" >/dev/null
+
+  for _ in $(seq 1 30); do
+    if proxy_is_ready; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+exec "$REAL_CODEX" \
+  -c 'model_provider="muyuan"' \
+  -c "model_providers.muyuan.base_url=\"$PROXY_BASE_URL\"" \
+  -c 'features.image_generation=false' \
+  -c 'features.web_search=false' \
+  "$@"

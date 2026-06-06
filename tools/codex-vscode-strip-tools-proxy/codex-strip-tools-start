@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-https://muyuan.do/v1}" \
+  python3 "$SCRIPT_DIR/codex-strip-tools-proxy.py" \
+    --host "${CODEX_STRIP_TOOLS_PROXY_HOST:-127.0.0.1}" \
+    --port "${CODEX_STRIP_TOOLS_PROXY_PORT:-18765}" \
+    --daemon \
+    --pid-file "${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}" \
+    --log-file "${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
