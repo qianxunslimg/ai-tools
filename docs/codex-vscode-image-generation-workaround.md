@@ -10,6 +10,9 @@ image_generation = false
 `app-server` 这条路径发出的请求里仍然可能带上 `image_generation` 这类 Responses 内置工具。
 如果自定义 Responses 兼容服务提供方不支持这些内置工具，可以通过本地代理在转发请求前把它们删掉。
 
+这个绕过方案只应该影响中转站模式。账号模式下，如果 `~/.codex/config.toml` 没有 active
+`model_provider`，封装脚本会直接运行真实 Codex，不启动代理。
+
 ## 本地命令
 
 从 `tools/codex-vscode-strip-tools-proxy/` 安装后，可以使用下面这些命令。
@@ -60,12 +63,12 @@ cat /tmp/codex_strip_tools_proxy.pid
 ```text
 封装脚本: /home/<user>/.codex/bin/codex-vscode-wrapper
 代理地址: http://127.0.0.1:18765/v1
-上游地址: https://muyuan.do/v1
+上游地址: 从 ~/.codex/config.toml 当前 active provider 的 base_url 读取
 日志文件: /tmp/codex_strip_tools_proxy.log
 进程号文件: /tmp/codex_strip_tools_proxy.pid
 ```
 
-封装脚本会自动启动代理，通常不需要手动启动。
+封装脚本只会在检测到中转站 provider 时自动启动代理。账号模式下不会启动代理。
 
 ## 移除绕过方案
 

@@ -9,3 +9,5 @@
 - `tools/codex-vscode-strip-tools-proxy/`：临时绕过方案，用来处理 Codex VS Code
   扩展向自定义服务提供方发送不支持的 Responses 内置工具的问题。
 - `docs/codex-vscode-image-generation-workaround.md`：安装、启动、停止和移除该绕过方案的操作说明。
+- `docs/codex-vscode-relay-api/`：记录 VS Code Codex 使用 OpenAI 兼容中转站
+  API 的配置步骤。

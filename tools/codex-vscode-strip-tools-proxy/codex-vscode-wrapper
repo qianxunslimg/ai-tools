@@ -11,8 +11,135 @@ PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
 PROXY_SCRIPT="${CODEX_STRIP_TOOLS_PROXY_SCRIPT:-$HOME/.codex/bin/codex-strip-tools-proxy.py}"
 PROXY_PID_FILE="${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}"
 PROXY_LOG_FILE="${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
-UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-https://muyuan.do/v1}"
+PROXY_UPSTREAM_FILE="${CODEX_STRIP_TOOLS_UPSTREAM_FILE:-/tmp/codex_strip_tools_proxy.upstream}"
 REAL_CODEX="${CODEX_REAL_BIN:-$HOME/.vscode/extensions/openai.chatgpt-26.602.40724-linux-x64/bin/linux-x86_64/codex}"
+CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
+
+read_provider_config() {
+  python3 - "$CONFIG_FILE" "${CODEX_VSCODE_MODEL_PROVIDER:-}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+provider_override = sys.argv[2]
+
+try:
+    text = config_path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    if provider_override:
+        sys.exit(f"Codex config not found: {config_path}")
+    raise SystemExit(0)
+
+
+def parse_with_toml():
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
+    except ModuleNotFoundError:
+        return None
+
+    cfg = tomllib.loads(text)
+    provider = provider_override or cfg.get("model_provider")
+    if not provider:
+        return None
+
+    provider_cfg = (cfg.get("model_providers") or {}).get(provider)
+    if not provider_cfg:
+        sys.exit(f"Provider {provider!r} not found in Codex config")
+
+    base_url = provider_cfg.get("base_url")
+    if not base_url:
+        sys.exit(f"Provider {provider!r} has no base_url")
+    return provider, base_url
+
+
+def strip_comment(line):
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            continue
+        if char == "#" and quote is None:
+            return line[:index]
+    return line
+
+
+def parse_without_toml():
+    provider = provider_override
+    if not provider:
+        for raw_line in text.splitlines():
+            line = strip_comment(raw_line).strip()
+            match = re.fullmatch(r'''model_provider\s*=\s*["']([^"']+)["']''', line)
+            if match:
+                provider = match.group(1)
+                break
+    if not provider:
+        return None
+
+    current_provider = None
+    for raw_line in text.splitlines():
+        line = strip_comment(raw_line).strip()
+        section = re.fullmatch(r'''\[model_providers\.([A-Za-z0-9_-]+)\]''', line)
+        if section:
+            current_provider = section.group(1)
+            continue
+        if current_provider == provider:
+            match = re.fullmatch(r'''base_url\s*=\s*["']([^"']+)["']''', line)
+            if match:
+                return provider, match.group(1)
+
+    sys.exit(f"Provider {provider!r} has no base_url")
+
+
+provider_config = parse_with_toml()
+if provider_config is None:
+    provider_config = parse_without_toml()
+if provider_config is None:
+    raise SystemExit(0)
+provider, base_url = provider_config
+if not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+    sys.exit(f"Unsupported provider name: {provider!r}")
+print(provider)
+print(base_url)
+PY
+}
+
+if [ -n "${CODEX_VSCODE_MODEL_PROVIDER:-}" ] && [ -n "${CODEX_STRIP_TOOLS_UPSTREAM:-}" ]; then
+  CODEX_MODEL_PROVIDER="$CODEX_VSCODE_MODEL_PROVIDER"
+  UPSTREAM_BASE_URL="$CODEX_STRIP_TOOLS_UPSTREAM"
+else
+  CONFIG_OUTPUT="$(read_provider_config)"
+  if [ -z "$CONFIG_OUTPUT" ]; then
+    if [ -n "${CODEX_STRIP_TOOLS_UPSTREAM:-}" ]; then
+      echo "CODEX_STRIP_TOOLS_UPSTREAM requires CODEX_VSCODE_MODEL_PROVIDER or an active model_provider." >&2
+      exit 2
+    fi
+    exec "$REAL_CODEX" "$@"
+  fi
+  CODEX_MODEL_PROVIDER="$(printf '%s\n' "$CONFIG_OUTPUT" | sed -n '1p')"
+  CONFIG_UPSTREAM_BASE_URL="$(printf '%s\n' "$CONFIG_OUTPUT" | sed -n '2p')"
+  UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-$CONFIG_UPSTREAM_BASE_URL}"
+fi
+
+case "$CODEX_MODEL_PROVIDER" in
+  ''|*[!A-Za-z0-9_-]*)
+    echo "Unsupported CODEX_VSCODE_MODEL_PROVIDER: $CODEX_MODEL_PROVIDER" >&2
+    exit 2
+    ;;
+esac
 
 proxy_is_ready() {
   python3 - "$PROXY_HOST" "$PROXY_PORT" <<'PY'
@@ -31,6 +158,58 @@ finally:
 PY
 }
 
+wait_for_proxy_ready() {
+  for _ in $(seq 1 30); do
+    if proxy_is_ready; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+proxy_matches_upstream() {
+  [ -f "$PROXY_UPSTREAM_FILE" ] || return 1
+  [ "$(cat "$PROXY_UPSTREAM_FILE" 2>/dev/null || true)" = "$UPSTREAM_BASE_URL" ]
+}
+
+stop_existing_proxy() {
+  [ -f "$PROXY_PID_FILE" ] || return 0
+
+  pid="$(cat "$PROXY_PID_FILE" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PROXY_PID_FILE"
+    return 0
+  fi
+
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  case "$args" in
+    *"$PROXY_SCRIPT"*) ;;
+    *) return 0 ;;
+  esac
+
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  rm -f "$PROXY_PID_FILE"
+}
+
+if proxy_is_ready && ! proxy_matches_upstream; then
+  stop_existing_proxy
+  if proxy_is_ready; then
+    echo "Proxy is already running with a different upstream; stop it before continuing." >&2
+    exit 1
+  fi
+fi
+
 if ! proxy_is_ready; then
   UPSTREAM_BASE_URL="$UPSTREAM_BASE_URL" \
     python3 "$PROXY_SCRIPT" \
@@ -40,17 +219,20 @@ if ! proxy_is_ready; then
       --pid-file "$PROXY_PID_FILE" \
       --log-file "$PROXY_LOG_FILE" >/dev/null
 
-  for _ in $(seq 1 30); do
-    if proxy_is_ready; then
-      break
+  if ! wait_for_proxy_ready; then
+    echo "Proxy failed to become ready at ${PROXY_BASE_URL}; not starting Codex." >&2
+    if [ -f "$PROXY_LOG_FILE" ]; then
+      tail -n 20 "$PROXY_LOG_FILE" >&2 || true
     fi
-    sleep 0.1
-  done
+    exit 1
+  fi
+
+  printf '%s' "$UPSTREAM_BASE_URL" >"$PROXY_UPSTREAM_FILE"
 fi
 
 exec "$REAL_CODEX" \
-  -c 'model_provider="muyuan"' \
-  -c "model_providers.muyuan.base_url=\"$PROXY_BASE_URL\"" \
+  -c "model_provider=\"$CODEX_MODEL_PROVIDER\"" \
+  -c "model_providers.${CODEX_MODEL_PROVIDER}.base_url=\"$PROXY_BASE_URL\"" \
   -c 'features.image_generation=false' \
   -c 'features.web_search=false' \
   "$@"

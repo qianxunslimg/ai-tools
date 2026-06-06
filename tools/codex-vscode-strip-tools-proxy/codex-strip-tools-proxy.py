@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -28,7 +29,7 @@ def parse_csv(value):
 class ToolStrippingProxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    upstream = urllib.parse.urlparse(os.environ.get("UPSTREAM_BASE_URL", "https://muyuan.do/v1"))
+    upstream = urllib.parse.urlparse(os.environ.get("UPSTREAM_BASE_URL", "https://api.openai.com/v1"))
     strip_tools = parse_csv(
         os.environ.get(
             "STRIP_RESPONSE_TOOLS",
@@ -100,7 +101,23 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
     def _upstream_url(self):
         return f"{self.upstream.scheme}://{self.upstream.netloc}{self._upstream_path()}"
 
-    def _curl_command(self, body, headers):
+    @staticmethod
+    def _curl_config_quote(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    @classmethod
+    def _curl_config(cls, headers):
+        config_lines = []
+        for key, value in headers.items():
+            header_line = f"{key}: {value}"
+            if "\r" in header_line or "\n" in header_line:
+                raise ValueError(f"Unsupported newline in request header {key!r}")
+            config_lines.append(f"header = {cls._curl_config_quote(header_line)}")
+        if not config_lines:
+            return b""
+        return ("\n".join(config_lines) + "\n").encode("utf-8")
+
+    def _curl_command(self, body, config_fd):
         curl_cmd = [
             "curl",
             "-sS",
@@ -108,26 +125,46 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
             "--http1.1",
             "--connect-timeout",
             "30",
+            "--suppress-connect-headers",
             "-i",
+        ]
+        if config_fd is not None:
+            curl_cmd.extend(["--config", f"/dev/fd/{config_fd}"])
+        curl_cmd.extend([
             "-X",
             self.command,
             self._upstream_url(),
-        ]
+        ])
         if self.upstream_timeout_seconds > 0:
             curl_cmd.extend(["--max-time", str(self.upstream_timeout_seconds)])
-        for key, value in headers.items():
-            curl_cmd.extend(["-H", f"{key}: {value}"])
         if body or self.command in {"POST", "PUT", "PATCH"}:
             curl_cmd.extend(["--data-binary", "@-"])
         return curl_cmd
 
     def _start_curl(self, body, headers):
-        proc = subprocess.Popen(
-            self._curl_command(body, headers),
-            stdin=subprocess.PIPE if body or self.command in {"POST", "PUT", "PATCH"} else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        curl_config = self._curl_config(headers)
+        config_file = None
+        config_fd = None
+        pass_fds = ()
+        if curl_config:
+            config_file = tempfile.TemporaryFile()
+            config_file.write(curl_config)
+            config_file.flush()
+            config_file.seek(0)
+            config_fd = config_file.fileno()
+            pass_fds = (config_fd,)
+
+        try:
+            proc = subprocess.Popen(
+                self._curl_command(body, config_fd),
+                stdin=subprocess.PIPE if body or self.command in {"POST", "PUT", "PATCH"} else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                pass_fds=pass_fds,
+            )
+        finally:
+            if config_file is not None:
+                config_file.close()
         if proc.stdin is not None:
             try:
                 if body:
@@ -161,6 +198,18 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
         reason = status_parts[2] if len(status_parts) > 2 else ""
         return status, reason
 
+    @staticmethod
+    def _is_proxy_connect_header(status, reason):
+        return status == 200 and reason.lower() == "connection established"
+
+    @staticmethod
+    def _terminate_process(proc):
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
     def _read_response_header(self, proc):
         if proc.stdout is None:
             raise RuntimeError("curl stdout pipe is not available")
@@ -184,8 +233,8 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
                     break
                 header_block, buffer = split_result
                 header_lines = self._parse_header_lines(header_block)
-                status, _reason = self._parse_status(header_lines)
-                if 100 <= status < 200:
+                status, reason = self._parse_status(header_lines)
+                if 100 <= status < 200 or self._is_proxy_connect_header(status, reason):
                     continue
                 return header_lines, buffer
 
@@ -205,8 +254,7 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except BrokenPipeError:
-            if proc.poll() is None:
-                proc.kill()
+            self._terminate_process(proc)
             return
 
         return_code = proc.wait()
@@ -258,8 +306,7 @@ class ToolStrippingProxy(BaseHTTPRequestHandler):
             self.end_headers()
             self._stream_response_body(proc, first_body_chunk)
         except Exception as exc:
-            if proc is not None and proc.poll() is None:
-                proc.kill()
+            self._terminate_process(proc)
             self.log_message("代理错误：%s", exc)
             error = json.dumps({"error": str(exc)}).encode("utf-8")
             self.send_response(502)

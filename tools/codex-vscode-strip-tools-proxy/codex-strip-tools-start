@@ -2,10 +2,145 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-https://muyuan.do/v1}" \
+CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
+PROXY_HOST="${CODEX_STRIP_TOOLS_PROXY_HOST:-127.0.0.1}"
+PROXY_PORT="${CODEX_STRIP_TOOLS_PROXY_PORT:-18765}"
+PROXY_PID_FILE="${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}"
+PROXY_LOG_FILE="${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
+
+read_upstream_base_url() {
+  python3 - "$CONFIG_FILE" "${CODEX_VSCODE_MODEL_PROVIDER:-}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+provider_override = sys.argv[2]
+
+try:
+    text = config_path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    sys.exit(f"Codex config not found: {config_path}")
+
+try:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+if tomllib:
+    cfg = tomllib.loads(text)
+    provider = provider_override or cfg.get("model_provider")
+    if not provider:
+        sys.exit("No active model_provider in Codex config")
+    provider_cfg = (cfg.get("model_providers") or {}).get(provider)
+    if not provider_cfg or not provider_cfg.get("base_url"):
+        sys.exit(f"Provider {provider!r} has no base_url")
+    print(provider_cfg["base_url"])
+    raise SystemExit
+
+
+def strip_comment(line):
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            continue
+        if char == "#" and quote is None:
+            return line[:index]
+    return line
+
+
+provider = provider_override
+if not provider:
+    for raw_line in text.splitlines():
+        line = strip_comment(raw_line).strip()
+        match = re.fullmatch(r'''model_provider\s*=\s*["']([^"']+)["']''', line)
+        if match:
+            provider = match.group(1)
+            break
+if not provider:
+    sys.exit("No active model_provider in Codex config")
+
+current_provider = None
+for raw_line in text.splitlines():
+    line = strip_comment(raw_line).strip()
+    section = re.fullmatch(r'''\[model_providers\.([A-Za-z0-9_-]+)\]''', line)
+    if section:
+        current_provider = section.group(1)
+        continue
+    if current_provider == provider:
+        match = re.fullmatch(r'''base_url\s*=\s*["']([^"']+)["']''', line)
+        if match:
+            print(match.group(1))
+            raise SystemExit
+sys.exit(f"Provider {provider!r} has no base_url")
+PY
+}
+
+proxy_is_ready() {
+  python3 - "$PROXY_HOST" "$PROXY_PORT" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket()
+sock.settimeout(0.2)
+try:
+    sock.connect((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+
+wait_for_proxy_ready() {
+  for _ in $(seq 1 30); do
+    if proxy_is_ready; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+UPSTREAM_BASE_URL="${CODEX_STRIP_TOOLS_UPSTREAM:-}"
+if [ -z "$UPSTREAM_BASE_URL" ]; then
+  UPSTREAM_BASE_URL="$(read_upstream_base_url)"
+fi
+
+if proxy_is_ready; then
+  echo "代理已在运行：http://${PROXY_HOST}:${PROXY_PORT}/v1"
+  exit 0
+fi
+
+UPSTREAM_BASE_URL="$UPSTREAM_BASE_URL" \
   python3 "$SCRIPT_DIR/codex-strip-tools-proxy.py" \
-    --host "${CODEX_STRIP_TOOLS_PROXY_HOST:-127.0.0.1}" \
-    --port "${CODEX_STRIP_TOOLS_PROXY_PORT:-18765}" \
+    --host "$PROXY_HOST" \
+    --port "$PROXY_PORT" \
     --daemon \
-    --pid-file "${CODEX_STRIP_TOOLS_PROXY_PID_FILE:-/tmp/codex_strip_tools_proxy.pid}" \
-    --log-file "${CODEX_STRIP_TOOLS_PROXY_LOG_FILE:-/tmp/codex_strip_tools_proxy.log}"
+    --pid-file "$PROXY_PID_FILE" \
+    --log-file "$PROXY_LOG_FILE" >/dev/null
+
+if ! wait_for_proxy_ready; then
+  echo "代理启动失败：http://${PROXY_HOST}:${PROXY_PORT}/v1 未 ready" >&2
+  if [ -f "$PROXY_LOG_FILE" ]; then
+    tail -n 20 "$PROXY_LOG_FILE" >&2 || true
+  fi
+  exit 1
+fi
+
+echo "代理已启动：http://${PROXY_HOST}:${PROXY_PORT}/v1"
